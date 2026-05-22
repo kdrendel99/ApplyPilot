@@ -13,9 +13,12 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Callable
 
 from rich.console import Console
 from rich.panel import Panel
@@ -155,7 +158,7 @@ def _run_pdf() -> dict:
 
 
 # Map stage names to their runner functions
-_STAGE_RUNNERS: dict[str, callable] = {
+_STAGE_RUNNERS: dict[str, Callable[..., dict]] = {
     "discover": _run_discover,
     "enrich":   _run_enrich,
     "score":    _run_score,
@@ -163,6 +166,165 @@ _STAGE_RUNNERS: dict[str, callable] = {
     "cover":    _run_cover,
     "pdf":      _run_pdf,
 }
+
+
+# ---------------------------------------------------------------------------
+# Run logging
+# ---------------------------------------------------------------------------
+
+_LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+_LOGGER_STAGE_PREFIXES = (
+    ("applypilot.discovery.", "discover"),
+    ("applypilot.enrichment.", "enrich"),
+    ("applypilot.scoring.scorer", "score"),
+    ("applypilot.scoring.tailor", "tailor"),
+    ("applypilot.scoring.cover_letter", "cover"),
+    ("applypilot.scoring.pdf", "pdf"),
+)
+
+
+class _StageLogRouter(logging.Handler):
+    """Route applypilot.* log records to the stage active on the current thread."""
+
+    def __init__(self, stage_files: dict[str, object]):
+        super().__init__(level=logging.NOTSET)
+        self._stage_files = stage_files
+        self._thread_stages: dict[int, str] = {}
+        self._lock = threading.RLock()
+        self.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+
+    def activate(self, stage: str) -> None:
+        with self._lock:
+            self._thread_stages[threading.get_ident()] = stage
+
+    def deactivate(self) -> None:
+        with self._lock:
+            self._thread_stages.pop(threading.get_ident(), None)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not record.name.startswith("applypilot"):
+            return
+
+        try:
+            msg = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+
+        with self._lock:
+            stage = self._thread_stages.get(record.thread) or self._stage_for_logger(record.name)
+            if not stage:
+                return
+            stream = self._stage_files.get(stage)
+            if stream is None:
+                return
+            try:
+                stream.write(msg + "\n")
+                stream.flush()
+            except Exception:
+                self.handleError(record)
+
+    @staticmethod
+    def _stage_for_logger(logger_name: str) -> str | None:
+        for prefix, stage in _LOGGER_STAGE_PREFIXES:
+            if logger_name.startswith(prefix):
+                return stage
+        return None
+
+
+class _PipelineRunLogger:
+    """Owns per-run and per-stage log files for one pipeline invocation."""
+
+    def __init__(self, ordered: list[str]):
+        from applypilot.config import LOG_DIR
+
+        self.run_dir = self._make_run_dir(LOG_DIR)
+        self.stage_paths = {stage: self.run_dir / f"{stage}.log" for stage in ordered}
+        self._files: dict[str, object] = {}
+        self._router: _StageLogRouter | None = None
+        self._logger = logging.getLogger("applypilot")
+        self._previous_level = self._logger.level
+
+        for stage, path in self.stage_paths.items():
+            path.touch()
+            self._files[stage] = path.open("a", encoding="utf-8", buffering=1)
+
+    @staticmethod
+    def _make_run_dir(log_root: Path) -> Path:
+        runs_root = log_root / "runs"
+        runs_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{timestamp}-{os.getpid()}"
+        run_dir = runs_root / base
+        suffix = 1
+        while run_dir.exists():
+            run_dir = runs_root / f"{base}-{suffix}"
+            suffix += 1
+        run_dir.mkdir()
+        return run_dir
+
+    def install(self) -> None:
+        self._router = _StageLogRouter(self._files)
+        self._logger.addHandler(self._router)
+        if self._logger.level == logging.NOTSET or self._logger.level > logging.INFO:
+            self._logger.setLevel(logging.INFO)
+
+    def close(self) -> None:
+        if self._router is not None:
+            self._logger.removeHandler(self._router)
+            self._router.close()
+            self._router = None
+        self._logger.setLevel(self._previous_level)
+        for stream in self._files.values():
+            stream.close()
+        self._files.clear()
+
+    def activate_stage(self, stage: str) -> None:
+        if self._router is not None:
+            self._router.activate(stage)
+
+    def deactivate_stage(self) -> None:
+        if self._router is not None:
+            self._router.deactivate()
+
+    def write_stage_header(self, stage: str, started_at: datetime) -> None:
+        meta = STAGE_META[stage]
+        self._write(stage, f"Stage: {stage}")
+        self._write(stage, f"Description: {meta['desc']}")
+        self._write(stage, f"Start time: {started_at.strftime(_LOG_TIME_FORMAT)}")
+        self._write(stage, "")
+
+    def write_stage_footer(
+        self,
+        stage: str,
+        completed_at: datetime,
+        elapsed: float,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        self._write(stage, "")
+        self._write(stage, f"Completion time: {completed_at.strftime(_LOG_TIME_FORMAT)}")
+        self._write(stage, f"Elapsed seconds: {elapsed:.3f}")
+        self._write(stage, f"Final status: {status}")
+        if error:
+            self._write(stage, f"Error: {error}")
+
+    def update_latest_pointer(self) -> None:
+        latest = self.run_dir.parent / "latest"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(self.run_dir, target_is_directory=True)
+        except OSError:
+            latest.write_text(str(self.run_dir) + "\n", encoding="utf-8")
+
+    def _write(self, stage: str, message: str) -> None:
+        stream = self._files[stage]
+        stream.write(message + "\n")
+        stream.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +481,48 @@ def _run_stage_streaming(
     tracker.mark_done(stage, {"status": "ok", "passes": passes})
 
 
+def _run_stage_streaming_logged(
+    stage: str,
+    tracker: _StageTracker,
+    stop_event: threading.Event,
+    run_logger: _PipelineRunLogger,
+    min_score: int = 7,
+    workers: int = 1,
+    validation_mode: str = "normal",
+) -> None:
+    started_at = datetime.now().astimezone()
+    t0 = time.time()
+    status = "unknown"
+    error: str | None = None
+
+    run_logger.write_stage_header(stage, started_at)
+    run_logger.activate_stage(stage)
+    try:
+        _run_stage_streaming(stage, tracker, stop_event, min_score, workers, validation_mode)
+        status = tracker.get_results().get(stage, {}).get("status", "unknown")
+    except Exception as e:
+        status = f"error: {e}"
+        error = str(e)
+        log.exception("Stage '%s' crashed", stage)
+        tracker.mark_done(stage, {"status": status})
+    finally:
+        run_logger.deactivate_stage()
+        run_logger.write_stage_footer(
+            stage,
+            datetime.now().astimezone(),
+            time.time() - t0,
+            status,
+            error,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    validation_mode: str = "normal",
+                    run_logger: _PipelineRunLogger | None = None) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -338,7 +536,14 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
         console.print(f"{'=' * 70}")
 
         t0 = time.time()
+        started_at = datetime.now().astimezone()
         runner = _STAGE_RUNNERS[name]
+        status = "unknown"
+        error: str | None = None
+
+        if run_logger:
+            run_logger.write_stage_header(name, started_at)
+            run_logger.activate_stage(name)
 
         try:
             kwargs: dict = {}
@@ -364,8 +569,19 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
         except Exception as e:
             elapsed = time.time() - t0
             status = f"error: {e}"
+            error = str(e)
             log.exception("Stage '%s' crashed", name)
             console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
+        finally:
+            if run_logger:
+                run_logger.deactivate_stage()
+                run_logger.write_stage_footer(
+                    name,
+                    datetime.now().astimezone(),
+                    time.time() - t0,
+                    status,
+                    error,
+                )
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
         if status not in ("ok", "partial"):
@@ -378,13 +594,14 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   validation_mode: str = "normal",
+                   run_logger: _PipelineRunLogger | None = None) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
     pipeline_start = time.time()
 
-    console.print(f"\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
+    console.print("\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
     console.print(f"  Poll interval: {_STREAM_POLL_INTERVAL}s\n")
 
     # Mark stages NOT in `ordered` as done so downstream doesn't wait for them
@@ -398,9 +615,15 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
 
     for name in ordered:
         start_times[name] = time.time()
+        if run_logger:
+            target = _run_stage_streaming_logged
+            args = (name, tracker, stop_event, run_logger, min_score, workers, validation_mode)
+        else:
+            target = _run_stage_streaming
+            args = (name, tracker, stop_event, min_score, workers, validation_mode)
         t = threading.Thread(
-            target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            target=target,
+            args=args,
             name=f"stage-{name}",
             daemon=True,
         )
@@ -492,16 +715,33 @@ def run_pipeline(
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")
-        console.print(f"\n  No changes made.")
+        console.print("\n  No changes made.")
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
+    run_logger = _PipelineRunLogger(ordered)
+    console.print(f"  Run logs:   {run_logger.run_dir}")
+    for name in ordered:
+        console.print(f"    {name:<12s} {run_logger.stage_paths[name]}")
+
     # Execute
-    if stream:
-        result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
-    else:
-        result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+    run_logger.install()
+    try:
+        if stream:
+            result = _run_streaming(ordered, min_score, workers=workers,
+                                    validation_mode=validation_mode,
+                                    run_logger=run_logger)
+        else:
+            result = _run_sequential(ordered, min_score, workers=workers,
+                                     validation_mode=validation_mode,
+                                     run_logger=run_logger)
+    finally:
+        run_logger.update_latest_pointer()
+        run_logger.close()
+
+    result["run_log_dir"] = str(run_logger.run_dir)
+    result["stage_log_paths"] = {
+        stage: str(path) for stage, path in run_logger.stage_paths.items()
+    }
 
     # Summary table
     console.print(f"\n{'=' * 70}")
@@ -527,7 +767,7 @@ def run_pipeline(
 
     # Final DB stats
     final = get_stats()
-    console.print(f"\n  [bold]DB Final State:[/bold]")
+    console.print("\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")
