@@ -38,6 +38,9 @@ def test_run_pipeline_creates_per_stage_logs(monkeypatch, tmp_path):
     log_dir = _stub_runtime(monkeypatch, tmp_path)
 
     def run_score():
+        pipeline.console.print("score console marker")
+        print("score stdout marker")
+        print("score stderr marker", file=sys.stderr)
         logging.getLogger("applypilot.tests").info("score marker")
         return {"status": "ok"}
 
@@ -61,6 +64,9 @@ def test_run_pipeline_creates_per_stage_logs(monkeypatch, tmp_path):
         "score": str(score_log),
         "tailor": str(tailor_log),
     }
+    run_log = run_dir / "run.log"
+    assert result["run_log_path"] == str(run_log)
+    assert run_log.exists()
 
     score_text = score_log.read_text(encoding="utf-8")
     assert "Stage: score" in score_text
@@ -70,7 +76,16 @@ def test_run_pipeline_creates_per_stage_logs(monkeypatch, tmp_path):
     assert "Elapsed seconds:" in score_text
     assert "Final status: ok" in score_text
     assert "score marker" in score_text
+    assert "score console marker" in score_text
+    assert "score stdout marker" in score_text
+    assert "score stderr marker" in score_text
     assert "tailor marker" not in score_text
+
+    run_text = run_log.read_text(encoding="utf-8")
+    assert "Run logs:" in run_text
+    assert "score console marker" in run_text
+    assert "score stdout marker" in run_text
+    assert "score stderr marker" in run_text
 
     tailor_text = tailor_log.read_text(encoding="utf-8")
     assert "Stage: tailor" in tailor_text

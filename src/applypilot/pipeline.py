@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TextIO
 
 from rich.console import Console
 from rich.panel import Panel
@@ -183,10 +184,50 @@ _LOGGER_STAGE_PREFIXES = (
 )
 
 
+class _ThreadAwareLogStream:
+    """Mirror stdout/stderr to a run log and the current thread's stage log."""
+
+    def __init__(
+        self,
+        original: TextIO,
+        run_stream: TextIO,
+        stage_streams: dict[int, TextIO],
+        lock: threading.RLock,
+    ):
+        self._original = original
+        self._run_stream = run_stream
+        self._stage_streams = stage_streams
+        self._lock = lock
+
+    def write(self, data: str) -> int:
+        written = self._original.write(data)
+        self._original.flush()
+        if data:
+            with self._lock:
+                self._run_stream.write(data)
+                self._run_stream.flush()
+                stage_stream = self._stage_streams.get(threading.get_ident())
+                if stage_stream is not None:
+                    stage_stream.write(data)
+                    stage_stream.flush()
+        return len(data) if written is None else written
+
+    def flush(self) -> None:
+        self._original.flush()
+        with self._lock:
+            self._run_stream.flush()
+            stage_stream = self._stage_streams.get(threading.get_ident())
+            if stage_stream is not None:
+                stage_stream.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._original, name)
+
+
 class _StageLogRouter(logging.Handler):
     """Route applypilot.* log records to the stage active on the current thread."""
 
-    def __init__(self, stage_files: dict[str, object]):
+    def __init__(self, stage_files: dict[str, TextIO]):
         super().__init__(level=logging.NOTSET)
         self._stage_files = stage_files
         self._thread_stages: dict[int, str] = {}
@@ -242,11 +283,17 @@ class _PipelineRunLogger:
         from applypilot.config import LOG_DIR
 
         self.run_dir = self._make_run_dir(LOG_DIR)
+        self.run_path = self.run_dir / "run.log"
         self.stage_paths = {stage: self.run_dir / f"{stage}.log" for stage in ordered}
-        self._files: dict[str, object] = {}
+        self._files: dict[str, TextIO] = {}
+        self._run_file: TextIO | None = None
         self._router: _StageLogRouter | None = None
         self._logger = logging.getLogger("applypilot")
         self._previous_level = self._logger.level
+        self._stdout: TextIO | None = None
+        self._stderr: TextIO | None = None
+        self._stage_streams: dict[int, TextIO] = {}
+        self._output_lock = threading.RLock()
 
         for stage, path in self.stage_paths.items():
             path.touch()
@@ -267,17 +314,47 @@ class _PipelineRunLogger:
         return run_dir
 
     def install(self) -> None:
+        self._run_file = self.run_path.open("a", encoding="utf-8", buffering=1)
+        self._run_file.write(f"Run output log: {self.run_path}\n")
+        self._run_file.flush()
+        stdout = sys.stdout
+        stderr = sys.stderr
+        self._stdout = stdout
+        self._stderr = stderr
+        sys.stdout = _ThreadAwareLogStream(
+            stdout,
+            self._run_file,
+            self._stage_streams,
+            self._output_lock,
+        )  # type: ignore[assignment]
+        sys.stderr = _ThreadAwareLogStream(
+            stderr,
+            self._run_file,
+            self._stage_streams,
+            self._output_lock,
+        )  # type: ignore[assignment]
         self._router = _StageLogRouter(self._files)
         self._logger.addHandler(self._router)
         if self._logger.level == logging.NOTSET or self._logger.level > logging.INFO:
             self._logger.setLevel(logging.INFO)
 
     def close(self) -> None:
+        if self._stdout is not None:
+            sys.stdout = self._stdout  # type: ignore[assignment]
+            self._stdout = None
+        if self._stderr is not None:
+            sys.stderr = self._stderr  # type: ignore[assignment]
+            self._stderr = None
+        with self._output_lock:
+            self._stage_streams.clear()
         if self._router is not None:
             self._logger.removeHandler(self._router)
             self._router.close()
             self._router = None
         self._logger.setLevel(self._previous_level)
+        if self._run_file is not None:
+            self._run_file.close()
+            self._run_file = None
         for stream in self._files.values():
             stream.close()
         self._files.clear()
@@ -285,10 +362,16 @@ class _PipelineRunLogger:
     def activate_stage(self, stage: str) -> None:
         if self._router is not None:
             self._router.activate(stage)
+        stream = self._files.get(stage)
+        if stream is not None:
+            with self._output_lock:
+                self._stage_streams[threading.get_ident()] = stream
 
     def deactivate_stage(self) -> None:
         if self._router is not None:
             self._router.deactivate()
+        with self._output_lock:
+            self._stage_streams.pop(threading.get_ident(), None)
 
     def write_stage_header(self, stage: str, started_at: datetime) -> None:
         meta = STAGE_META[stage]
@@ -719,13 +802,14 @@ def run_pipeline(
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
     run_logger = _PipelineRunLogger(ordered)
-    console.print(f"  Run logs:   {run_logger.run_dir}")
-    for name in ordered:
-        console.print(f"    {name:<12s} {run_logger.stage_paths[name]}")
-
-    # Execute
     run_logger.install()
     try:
+        console.print(f"  Run logs:   {run_logger.run_dir}")
+        console.print(f"  Run output: {run_logger.run_path}")
+        for name in ordered:
+            console.print(f"    {name:<12s} {run_logger.stage_paths[name]}")
+
+        # Execute
         if stream:
             result = _run_streaming(ordered, min_score, workers=workers,
                                     validation_mode=validation_mode,
@@ -739,6 +823,7 @@ def run_pipeline(
         run_logger.close()
 
     result["run_log_dir"] = str(run_logger.run_dir)
+    result["run_log_path"] = str(run_logger.run_path)
     result["stage_log_paths"] = {
         stage: str(path) for stage, path in run_logger.stage_paths.items()
     }
